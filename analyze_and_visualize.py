@@ -193,17 +193,38 @@ for widget in pdf_widgets:
     else:
         categories['Other PDF'] += 1
 
-fig, ax = plt.subplots(figsize=(10, 10))
-colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8']
-wedges, texts, autotexts = ax.pie(categories.values(), labels=categories.keys(),
-                                    autopct='%1.0f%%', colors=colors, startangle=90,
-                                    textprops={'fontsize': 11, 'fontweight': 'bold'})
-ax.set_title(f'PDF Widget Categories (Total: {len(pdf_widgets)} widgets)',
-             fontweight='bold', fontsize=14, pad=20)
+# Remove zero categories
+categories = {k: v for k, v in categories.items() if v > 0}
+
+fig, ax = plt.subplots(figsize=(12, 8))
+colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8'][:len(categories)]
+
+# Create explode to separate slices
+explode = [0.05] * len(categories)
+
+wedges, texts, autotexts = ax.pie(
+    categories.values(),
+    labels=categories.keys(),
+    autopct=lambda pct: f'{pct:.0f}%\n({int(pct/100.*sum(categories.values()))})',
+    colors=colors,
+    startangle=90,
+    explode=explode,
+    textprops={'fontsize': 14, 'fontweight': 'bold'},
+    pctdistance=0.65
+)
+
+ax.set_title(f'PDF Widget Categories Analysis\nTotal PDF Widgets: {len(pdf_widgets)} (9% of marketplace)',
+             fontweight='bold', fontsize=16, pad=20)
+
+# Improve label visibility
+for text in texts:
+    text.set_fontsize(13)
+    text.set_fontweight('bold')
 
 for autotext in autotexts:
     autotext.set_color('white')
-    autotext.set_fontsize(12)
+    autotext.set_fontsize(13)
+    autotext.set_fontweight('bold')
 
 plt.tight_layout()
 plt.savefig('charts/07_pdf_categories.png', dpi=300, bbox_inches='tight')
