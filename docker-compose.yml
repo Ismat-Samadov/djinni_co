@@ -1,0 +1,7 @@
+services:
+  scraper:
+    build: .
+    volumes:
+      - ./:/app
+    environment:
+      - PYTHONUNBUFFERED=1
