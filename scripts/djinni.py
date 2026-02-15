@@ -29,7 +29,12 @@ from typing import Any
 
 import aiohttp
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 from tqdm.asyncio import tqdm
+from yarl import URL as YarlURL
+
+# Load .env file if present (overrides are ignored — shell env takes priority)
+load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env", override=False)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_URL        = "https://djinni.co"
@@ -41,6 +46,9 @@ REQUEST_TIMEOUT = 25         # seconds per request
 MIN_DELAY       = 1.0        # seconds between requests per worker
 OUTPUT_PATH     = Path(__file__).parent.parent / "data" / "djinni.csv"
 CHECKPOINT_PATH = Path(__file__).parent.parent / "data" / ".djinni_checkpoint.json"
+# Optional: path to a Netscape-format cookies file exported from your browser
+# (Export with "Cookie-Editor" extension → Export → Netscape format → save as data/cookies.txt)
+COOKIES_FILE    = Path(__file__).parent.parent / "data" / "cookies.txt"
 
 HEADERS = {
     "User-Agent": (
@@ -51,7 +59,50 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Referer": "https://djinni.co/",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
 }
+
+
+def load_cookies() -> dict[str, str]:
+    """
+    Load cookies from:
+      1. DJINNI_COOKIES env var  — raw Cookie header string
+         e.g. export DJINNI_COOKIES="csrftoken=abc; sessionid=xyz"
+      2. data/cookies.txt        — Netscape cookie file (exported from browser)
+    Returns a dict suitable for aiohttp.
+    """
+    # 1. Environment variable (highest priority)
+    raw = os.environ.get("DJINNI_COOKIES", "").strip()
+    if raw:
+        cookies: dict[str, str] = {}
+        for part in raw.split(";"):
+            if "=" in part:
+                k, _, v = part.strip().partition("=")
+                cookies[k.strip()] = v.strip()
+        log.info("Loaded %d cookies from DJINNI_COOKIES env var", len(cookies))
+        return cookies
+
+    # 2. Netscape cookies file
+    if COOKIES_FILE.exists():
+        cookies = {}
+        for line in COOKIES_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7 and "djinni.co" in parts[0]:
+                cookies[parts[5]] = parts[6]
+        if cookies:
+            log.info("Loaded %d cookies from %s", len(cookies), COOKIES_FILE)
+            return cookies
+
+    log.warning(
+        "No cookies found. Set DJINNI_COOKIES env var or export browser cookies to %s. "
+        "Without cookies Djinni may block requests.",
+        COOKIES_FILE,
+    )
+    return {}
 
 # All CSV columns
 CSV_FIELDS = [
@@ -465,126 +516,96 @@ async def scrape_detail(
         url = BASE_URL + url
     html = await fetch(session, url, sem)
     if html is None:
-        return stub  # return with listing-only data
-    return parse_detail_page(html, stub)
-
-
-async def collect_all_urls(
-    session: aiohttp.ClientSession,
-    sem: asyncio.Semaphore,
-    start_page: int,
-) -> tuple[list[dict], int]:
-    """Fetch all listing pages and return stubs + total pages discovered."""
-    log.info("Fetching page 1 to discover total pages…")
-    html = await fetch(session, f"{JOBS_URL}?page=1", sem)
-    if not html:
-        log.error("Failed to fetch page 1 — aborting")
-        return [], 0
-
-    first_stubs, total_pages = parse_listing_page(html)
-    log.info("Total pages: %d", total_pages)
-
-    all_stubs: list[dict] = first_stubs if start_page <= 1 else []
-
-    pages = list(range(max(2, start_page), total_pages + 1))
-
-    async def fetch_page(page: int) -> list[dict]:
-        if _shutdown:
-            return []
-        h = await fetch(session, f"{JOBS_URL}?page={page}", sem)
-        if not h:
-            log.warning("Empty response on listing page %d", page)
-            return []
-        stubs, _ = parse_listing_page(h)
-        return stubs
-
-    log.info("Fetching %d listing pages concurrently…", len(pages))
-    results = await tqdm.gather(
-        *[fetch_page(p) for p in pages],
-        desc="Listing pages",
-        unit="page",
-    )
-    for r in results:
-        all_stubs.extend(r)
-
-    return all_stubs, total_pages
+        return stub  # return with listing-only data on permanent failure
+    result = parse_detail_page(html, stub)
+    if result is None:
+        # IP block page slipped through — treat as failure, save stub only
+        log.warning("Block page received for %s — saving stub only", url)
+        return stub
+    return result
 
 
 async def main() -> None:
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     # Load checkpoint
-    ckpt       = load_checkpoint()
-    done_urls  = set(ckpt["done_urls"])
-    last_page  = ckpt["last_page"]
+    ckpt      = load_checkpoint()
+    done_urls = set(ckpt["done_urls"])
+    last_page = ckpt["last_page"]
 
     if done_urls:
         log.info("Resuming — %d jobs already scraped", len(done_urls))
 
     init_csv()
 
-    connector = aiohttp.TCPConnector(limit=CONCURRENCY, ssl=False)
-    sem       = asyncio.Semaphore(CONCURRENCY)
+    connector       = aiohttp.TCPConnector(limit=CONCURRENCY, ssl=False)
+    sem             = asyncio.Semaphore(CONCURRENCY)
+    jar             = aiohttp.CookieJar()
+    browser_cookies = load_cookies()
 
-    async with aiohttp.ClientSession(connector=connector) as session:
+    # Discover total pages from page 1
+    async with aiohttp.ClientSession(connector=connector, cookie_jar=jar) as session:
+        if browser_cookies:
+            session.cookie_jar.update_cookies(browser_cookies, response_url=YarlURL(BASE_URL))
 
-        # ── Phase 1: collect all job stubs from listing pages ─────────────
-        all_stubs, total_pages = await collect_all_urls(session, sem, start_page=last_page + 1)
+        log.info("Fetching page 1 to discover total pages…")
+        html = await fetch(session, f"{JOBS_URL}?page=1", sem)
+        if not html:
+            log.error("Failed to fetch page 1 — aborting")
+            return
+        first_stubs, total_pages = parse_listing_page(html)
+        log.info("Total pages: %d", total_pages)
 
-        # Filter already-done jobs
-        pending = [s for s in all_stubs if s.get("url") and s["url"] not in done_urls]
-        log.info(
-            "Jobs discovered: %d total, %d pending (skipping %d already done)",
-            len(all_stubs), len(pending), len(done_urls),
-        )
+        # Save page 1 stubs immediately
+        new_stubs = [s for s in first_stubs if s.get("url") and s["url"] not in done_urls]
+        if new_stubs:
+            append_rows(new_stubs)
+            for s in new_stubs:
+                done_urls.add(s["url"])
+            save_checkpoint(done_urls, 1)
+            log.info("Page 1: saved %d jobs", len(new_stubs))
 
-        # ── Phase 2: fetch detail pages ───────────────────────────────────
-        BATCH = 50  # save every N completions
+        pages = list(range(max(2, last_page + 1), total_pages + 1))
 
-        async def do_detail(stub: dict) -> dict | None:
+        async def fetch_and_save_page(page: int) -> int:
+            """Fetch one listing page, append new stubs to CSV immediately. Returns count saved."""
             if _shutdown:
-                return None
-            return await scrape_detail(session, sem, stub)
+                return 0
+            h = await fetch(session, f"{JOBS_URL}?page={page}", sem)
+            if not h:
+                log.warning("Empty response on listing page %d", page)
+                return 0
+            stubs, _ = parse_listing_page(h)
+            new = [s for s in stubs if s.get("url") and s["url"] not in done_urls]
+            if new:
+                append_rows(new)
+                for s in new:
+                    done_urls.add(s["url"])
+                save_checkpoint(done_urls, page)
+            return len(new)
 
-        pbar   = tqdm(total=len(pending), desc="Detail pages", unit="job")
-        buffer: list[dict] = []
+        log.info("Fetching %d listing pages (saving immediately)…", len(pages))
+        total_saved = len(new_stubs)
 
-        tasks = [asyncio.create_task(do_detail(s)) for s in pending]
+        pbar = tqdm(total=len(pages), desc="Pages", unit="page")
+        tasks = [asyncio.create_task(fetch_and_save_page(p)) for p in pages]
 
         for coro in asyncio.as_completed(tasks):
-            result = await coro
-            pbar.update(1)
-            if result is None:
-                continue
-            buffer.append(result)
-            done_urls.add(result.get("url", ""))
-
-            if len(buffer) >= BATCH or _shutdown:
-                append_rows(buffer)
-                save_checkpoint(done_urls, total_pages)
-                log.info("Saved batch of %d | total done: %d", len(buffer), len(done_urls))
-                buffer.clear()
-
             if _shutdown:
-                log.warning("Shutdown requested — flushing and exiting")
-                # Cancel remaining tasks
                 for t in tasks:
                     t.cancel()
                 break
+            n = await coro
+            total_saved += n
+            pbar.update(1)
+            pbar.set_postfix(saved=total_saved)
 
         pbar.close()
 
-        # Final flush
-        if buffer:
-            append_rows(buffer)
-            save_checkpoint(done_urls, total_pages)
-            log.info("Final flush: %d rows", len(buffer))
-
-    total_rows = sum(1 for _ in open(OUTPUT_PATH, encoding="utf-8")) - 1  # minus header
+    total_rows = sum(1 for _ in open(OUTPUT_PATH, encoding="utf-8")) - 1
     log.info("Done. %d total rows in %s", total_rows, OUTPUT_PATH)
 
     if not _shutdown:
-        # Clean checkpoint on clean exit
         CHECKPOINT_PATH.unlink(missing_ok=True)
         log.info("Checkpoint cleared (clean finish)")
 
