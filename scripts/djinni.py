@@ -1,251 +1,578 @@
 """
-Djinni.co job listings scraper
-Scrapes all job postings from djinni.co/jobs and saves to data/djinni.csv
+Djinni.co async job scraper
+────────────────────────────────────────────────────────────────────
+Features
+  • asyncio + aiohttp — concurrent fetching (configurable concurrency)
+  • Two-pass scrape: listing pages → detail pages
+  • Rich field extraction: JSON-LD + HTML fallback on detail pages
+  • Crash-proof: incremental CSV append, JSON checkpoint, SIGINT/SIGTERM
+  • Automatic retries with exponential back-off + jitter
+  • Resumable: skips already-scraped job URLs on restart
+  • Rate-limited via asyncio.Semaphore
+  • Progress bar via tqdm
 """
 
+from __future__ import annotations
+
+import asyncio
 import csv
 import json
 import logging
+import os
+import random
+import re
+import signal
+import sys
 import time
 from pathlib import Path
+from typing import Any
 
-import requests
+import aiohttp
 from bs4 import BeautifulSoup
+from tqdm.asyncio import tqdm
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-log = logging.getLogger(__name__)
+# ── Config ────────────────────────────────────────────────────────────────────
+BASE_URL        = "https://djinni.co"
+JOBS_URL        = f"{BASE_URL}/jobs/"
+CONCURRENCY     = 8          # parallel HTTP requests
+MAX_RETRIES     = 5          # retries per URL
+BACKOFF_BASE    = 1.5        # seconds (doubles each retry + jitter)
+REQUEST_TIMEOUT = 20         # seconds per request
+MIN_DELAY       = 0.3        # seconds between requests per worker
+OUTPUT_PATH     = Path(__file__).parent.parent / "data" / "djinni.csv"
+CHECKPOINT_PATH = Path(__file__).parent.parent / "data" / ".djinni_checkpoint.json"
 
-BASE_URL = "https://djinni.co/jobs/"
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Chrome/122.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Referer": "https://djinni.co/",
 }
-DELAY = 1.5  # seconds between requests
-OUTPUT_PATH = Path(__file__).parent.parent / "data" / "djinni.csv"
 
+# All CSV columns
 CSV_FIELDS = [
+    # ── from listing page (JSON-LD) ──────────────────────────────────────
     "title",
     "company",
     "url",
     "salary_min",
     "salary_max",
     "salary_currency",
-    "location",
-    "job_type",
-    "experience_months",
-    "english_level",
-    "category",
+    "job_type",           # FULL_TIME / PART_TIME / CONTRACTOR …
+    "category",           # e.g. Python, React.js
     "date_posted",
-    "description_snippet",
+    "location_type",      # TELECOMMUTE / INPERSON
+    "location_regions",   # e.g. Ukraine, Worldwide
+    "experience_months",
+    # ── from detail page (HTML) ──────────────────────────────────────────
+    "english_level",      # e.g. Upper Intermediate
+    "experience_years",   # e.g. 3 years
+    "work_format",        # Remote / Office / Hybrid
+    "city",
+    "country",
+    "domain",             # e.g. FinTech, Healthcare
+    "company_type",       # e.g. Product / Outsource / Startup
+    "company_size",       # e.g. 51-200
+    "views",
+    "applications",
+    "skills",             # comma-separated tags
+    "description",        # full plain-text description
 ]
 
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(
+            Path(__file__).parent.parent / "data" / "djinni_scraper.log",
+            encoding="utf-8",
+        ),
+    ],
+)
+log = logging.getLogger(__name__)
 
-def get_soup(url: str, session: requests.Session) -> BeautifulSoup:
-    response = session.get(url, headers=HEADERS, timeout=15)
-    response.raise_for_status()
-    return BeautifulSoup(response.text, "html.parser")
+# ── Checkpoint helpers ────────────────────────────────────────────────────────
+
+def load_checkpoint() -> dict:
+    if CHECKPOINT_PATH.exists():
+        try:
+            return json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"done_urls": [], "last_page": 0}
 
 
-def parse_json_ld(soup: BeautifulSoup) -> list[dict]:
-    """Extract jobs from JSON-LD structured data embedded in the page."""
-    jobs = []
+def save_checkpoint(done_urls: set[str], last_page: int) -> None:
+    CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CHECKPOINT_PATH.write_text(
+        json.dumps({"done_urls": list(done_urls), "last_page": last_page}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+# ── CSV helpers ───────────────────────────────────────────────────────────────
+
+def init_csv() -> None:
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not OUTPUT_PATH.exists():
+        with open(OUTPUT_PATH, "w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=CSV_FIELDS).writeheader()
+
+
+def append_rows(rows: list[dict]) -> None:
+    if not rows:
+        return
+    with open(OUTPUT_PATH, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+        w.writerows(rows)
+
+
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+async def fetch(
+    session: aiohttp.ClientSession,
+    url: str,
+    sem: asyncio.Semaphore,
+    *,
+    retries: int = MAX_RETRIES,
+) -> str | None:
+    """Fetch URL with retries, back-off, and semaphore-based rate limiting."""
+    async with sem:
+        for attempt in range(1, retries + 1):
+            try:
+                await asyncio.sleep(MIN_DELAY + random.uniform(0, 0.3))
+                async with session.get(
+                    url,
+                    headers=HEADERS,
+                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                    allow_redirects=True,
+                ) as resp:
+                    if resp.status == 429:
+                        wait = BACKOFF_BASE ** attempt + random.uniform(0, 1)
+                        log.warning("429 rate-limit on %s — waiting %.1fs", url, wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    if resp.status == 404:
+                        return None
+                    resp.raise_for_status()
+                    return await resp.text(encoding="utf-8", errors="replace")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                wait = BACKOFF_BASE ** attempt + random.uniform(0, 1)
+                log.warning(
+                    "Attempt %d/%d failed for %s (%s) — retrying in %.1fs",
+                    attempt, retries, url, exc, wait,
+                )
+                await asyncio.sleep(wait)
+        log.error("Gave up on %s after %d attempts", url, retries)
+        return None
+
+
+# ── Listing page parser ───────────────────────────────────────────────────────
+
+def _safe_int(v: Any) -> str:
+    try:
+        return str(int(v))
+    except (TypeError, ValueError):
+        return str(v) if v else ""
+
+
+def parse_listing_page(html: str) -> tuple[list[dict], int]:
+    """
+    Returns (list_of_job_stubs, total_pages).
+    Stubs contain all fields extractable from JSON-LD on the listing page.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    jobs: list[dict] = []
+
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "")
         except (json.JSONDecodeError, TypeError):
             continue
 
-        # Top-level ItemList
-        if isinstance(data, dict) and data.get("@type") == "ItemList":
-            for item in data.get("itemListElement", []):
-                job = item if item.get("@type") == "JobPosting" else item.get("item", {})
-                if job.get("@type") == "JobPosting":
-                    jobs.append(_extract_job(job))
-
-        # Single JobPosting
-        elif isinstance(data, dict) and data.get("@type") == "JobPosting":
-            jobs.append(_extract_job(data))
-
-        # List of JobPostings
+        postings: list[dict] = []
+        if isinstance(data, dict):
+            if data.get("@type") == "ItemList":
+                for item in data.get("itemListElement", []):
+                    p = item if item.get("@type") == "JobPosting" else item.get("item", {})
+                    if p.get("@type") == "JobPosting":
+                        postings.append(p)
+            elif data.get("@type") == "JobPosting":
+                postings.append(data)
         elif isinstance(data, list):
-            for entry in data:
-                if isinstance(entry, dict) and entry.get("@type") == "JobPosting":
-                    jobs.append(_extract_job(entry))
+            postings = [d for d in data if isinstance(d, dict) and d.get("@type") == "JobPosting"]
 
-    return jobs
+        for p in postings:
+            salary      = p.get("baseSalary", {}) or {}
+            sal_val     = salary.get("value", {}) or {}
+            org         = p.get("hiringOrganization", {}) or {}
+            exp         = p.get("experienceRequirements", {}) or {}
+            al          = p.get("applicantLocationRequirements", []) or []
+            if isinstance(al, dict):
+                al = [al]
+            regions = ", ".join(x.get("name", "") for x in al if isinstance(x, dict) and x.get("name"))
 
+            jobs.append({
+                "title":            p.get("title", ""),
+                "company":          org.get("name", "") if isinstance(org, dict) else "",
+                "url":              p.get("url", ""),
+                "salary_min":       _safe_int(sal_val.get("minValue", "")),
+                "salary_max":       _safe_int(sal_val.get("maxValue", "")),
+                "salary_currency":  salary.get("currency", "") if sal_val else "",
+                "job_type":         p.get("employmentType", ""),
+                "category":         p.get("category", ""),
+                "date_posted":      p.get("datePosted", ""),
+                "location_type":    p.get("jobLocationType", ""),
+                "location_regions": regions,
+                "experience_months": _safe_int(exp.get("monthsOfExperience", "")) if isinstance(exp, dict) else "",
+                # detail fields filled later
+                "english_level": "", "experience_years": "", "work_format": "",
+                "city": "", "country": "", "domain": "", "company_type": "",
+                "company_size": "", "views": "", "applications": "",
+                "skills": "", "description": "",
+            })
 
-def _extract_job(job: dict) -> dict:
-    salary = job.get("baseSalary", {})
-    salary_value = salary.get("value", {})
-    min_val = salary_value.get("minValue", "")
-    max_val = salary_value.get("maxValue", "")
-    currency = salary.get("currency", "USD")
-
-    org = job.get("hiringOrganization", {})
-    company = org.get("name", "") if isinstance(org, dict) else ""
-
-    exp = job.get("experienceRequirements", {})
-    exp_months = exp.get("monthsOfExperience", "") if isinstance(exp, dict) else ""
-
-    location_type = job.get("jobLocationType", "")
-    applicant_locations = job.get("applicantLocationRequirements", [])
-    if isinstance(applicant_locations, dict):
-        applicant_locations = [applicant_locations]
-    location_names = [loc.get("name", "") for loc in applicant_locations if isinstance(loc, dict)]
-    location = location_type + (" / " + ", ".join(location_names) if location_names else "")
-
-    description = job.get("description", "")
-    snippet = description[:300].replace("\n", " ").strip() if description else ""
-
-    return {
-        "title": job.get("title", ""),
-        "company": company,
-        "url": job.get("url", ""),
-        "salary_min": min_val,
-        "salary_max": max_val,
-        "salary_currency": currency if (min_val or max_val) else "",
-        "location": location,
-        "job_type": job.get("employmentType", ""),
-        "experience_months": exp_months,
-        "english_level": "",          # not in JSON-LD; filled from HTML below
-        "category": job.get("category", ""),
-        "date_posted": job.get("datePosted", ""),
-        "description_snippet": snippet,
-    }
-
-
-def parse_html_jobs(soup: BeautifulSoup) -> list[dict]:
-    """
-    Fallback / supplemental parser that reads the rendered HTML job cards.
-    Djinni renders cards with class 'job-list-item'.
-    """
-    jobs = []
-    for card in soup.select("ul.list-jobs li.job-list-item, li.list-jobs__item"):
-        job: dict = {f: "" for f in CSV_FIELDS}
-
-        # Title + URL
-        title_el = card.select_one("a.job-list-item__link")
-        if title_el:
-            job["title"] = title_el.get_text(strip=True)
-            href = title_el.get("href", "")
-            job["url"] = "https://djinni.co" + href if href.startswith("/") else href
-
-        # Company
-        company_el = card.select_one("a.job-list-item__company-link, a[data-analytics='company']")
-        if company_el:
-            job["company"] = company_el.get_text(strip=True)
-
-        # Salary
-        salary_el = card.select_one(".public-salary-item, span.salary")
-        if salary_el:
-            raw = salary_el.get_text(strip=True)
-            job["salary_min"] = raw  # store raw string when range parsing is unclear
-
-        # Meta badges (location, remote, English, experience)
-        for badge in card.select(".job-list-item__job-info span, .badge, .nobr"):
-            text = badge.get_text(strip=True).lower()
-            if "remote" in text or "office" in text or "hybrid" in text:
-                job["location"] = badge.get_text(strip=True)
-            elif "english" in text or "upper" in text or "intermediate" in text or "advanced" in text:
-                job["english_level"] = badge.get_text(strip=True)
-
-        # Posted date
-        date_el = card.select_one("span.mr-2 nobr, time, .job-list-item__applied-time, span[title]")
-        if date_el:
-            job["date_posted"] = date_el.get("title", "") or date_el.get_text(strip=True)
-
-        if job["title"]:
-            jobs.append(job)
-
-    return jobs
-
-
-def get_total_pages(soup: BeautifulSoup) -> int:
-    """Read pagination to find the last page number."""
-    # Try standard pagination links
-    pages = soup.select("ul.pagination li a[href*='page=']")
-    numbers = []
-    for a in pages:
+    # Pagination: find max page number in pagination links
+    total_pages = 1
+    for a in soup.select("ul.pagination li a[href*='page=']"):
         href = a.get("href", "")
-        try:
-            numbers.append(int(href.split("page=")[-1].split("&")[0]))
-        except ValueError:
-            pass
-    if numbers:
-        return max(numbers)
-
-    # Fallback: look for total count text
-    count_el = soup.select_one(".total-jobs-count, h1.h4")
-    if count_el:
-        text = count_el.get_text()
-        import re
-        m = re.search(r"([\d\s,]+)", text)
+        m = re.search(r"page=(\d+)", href)
         if m:
-            total = int(m.group(1).replace(" ", "").replace(",", ""))
-            return max(1, (total + 19) // 20)
+            total_pages = max(total_pages, int(m.group(1)))
 
-    return 1
+    # Fallback: parse total count from heading
+    if total_pages == 1:
+        h = soup.find(string=re.compile(r"\d[\d\s,]+jobs?", re.I))
+        if h:
+            m = re.search(r"([\d\s,]+)", h)
+            if m:
+                n = int(m.group(1).replace(" ", "").replace(",", ""))
+                total_pages = max(1, (n + 14) // 15)
 
-
-def scrape_page(page: int, session: requests.Session) -> tuple[list[dict], int]:
-    url = f"{BASE_URL}?page={page}"
-    log.info("Fetching page %d — %s", page, url)
-    soup = get_soup(url, session)
-
-    total_pages = get_total_pages(soup) if page == 1 else 0
-
-    # Try JSON-LD first; fall back to HTML parser
-    jobs = parse_json_ld(soup)
-    if not jobs:
-        log.warning("No JSON-LD jobs on page %d, trying HTML parser", page)
-        jobs = parse_html_jobs(soup)
-
-    log.info("  Found %d jobs on page %d", len(jobs), page)
     return jobs, total_pages
 
 
-def save_csv(rows: list[dict], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
-    log.info("Saved %d rows → %s", len(rows), path)
+# ── Detail page parser ────────────────────────────────────────────────────────
+
+def _text(el) -> str:
+    return el.get_text(" ", strip=True) if el else ""
 
 
-def main() -> None:
-    session = requests.Session()
-    all_jobs: list[dict] = []
+def parse_detail_page(html: str, stub: dict) -> dict:
+    """Enrich a job stub with fields scraped from the detail page."""
+    soup = BeautifulSoup(html, "lxml")
+    job  = dict(stub)  # copy
 
-    # --- Page 1: discover total pages ---
-    first_jobs, total_pages = scrape_page(1, session)
-    all_jobs.extend(first_jobs)
+    # ── JSON-LD on detail page (may duplicate some listing fields) ────────
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(data, dict) or data.get("@type") != "JobPosting":
+            continue
 
-    if total_pages < 1:
-        total_pages = 1
-    log.info("Total pages discovered: %d", total_pages)
+        jp_loc = data.get("jobLocation", {}) or {}
+        addr   = jp_loc.get("address", {}) or {}
+        if isinstance(addr, dict):
+            job["city"]    = job["city"]    or addr.get("addressLocality", "")
+            job["country"] = job["country"] or addr.get("addressCountry", "")
 
-    # --- Remaining pages ---
-    for page in range(2, total_pages + 1):
-        time.sleep(DELAY)
-        jobs, _ = scrape_page(page, session)
-        if not jobs:
-            log.warning("No jobs on page %d — stopping early", page)
+        if not job["description"]:
+            raw_desc = data.get("description", "")
+            if raw_desc:
+                desc_soup = BeautifulSoup(raw_desc, "lxml")
+                job["description"] = desc_soup.get_text(" ", strip=True)[:2000]
+
+        # skills from 'skills' field
+        skills_raw = data.get("skills", "")
+        if skills_raw and not job["skills"]:
+            job["skills"] = skills_raw if isinstance(skills_raw, str) else ", ".join(skills_raw)
+
+    # ── HTML badge/label parsing ──────────────────────────────────────────
+    # Djinni puts all job meta as small badges inside .job-details--title-wrapper
+    # or inside ul.job-additional-info > li
+
+    badge_texts: list[str] = []
+    for el in soup.select(
+        ".job-additional-info li, "
+        ".job-details--title-wrapper span, "
+        ".job-details--title-wrapper div, "
+        "p.text-default-7, "
+        ".label-group span, "
+        ".badge"
+    ):
+        t = el.get_text(" ", strip=True)
+        if t:
+            badge_texts.append(t)
+
+    tl = " | ".join(badge_texts).lower()
+
+    # English level
+    for pat, val in [
+        (r"upper[\s-]inter\w*",  "Upper Intermediate"),
+        (r"lower[\s-]inter\w*",  "Lower Intermediate"),
+        (r"inter\w*",            "Intermediate"),
+        (r"advanced",            "Advanced"),
+        (r"fluent",              "Fluent"),
+        (r"b2",                  "B2"),
+        (r"b1",                  "B1"),
+        (r"c1",                  "C1"),
+        (r"c2",                  "C2"),
+        (r"no english",          "No English"),
+    ]:
+        if re.search(pat, tl):
+            job["english_level"] = job["english_level"] or val
             break
-        all_jobs.extend(jobs)
 
-    log.info("Total jobs scraped: %d", len(all_jobs))
-    save_csv(all_jobs, OUTPUT_PATH)
+    # Work format
+    for pat, val in [
+        (r"\bhybrid\b",  "Hybrid"),
+        (r"\boffice\b",  "Office"),
+        (r"\bremote\b",  "Remote"),
+    ]:
+        if re.search(pat, tl):
+            job["work_format"] = job["work_format"] or val
+            break
+
+    # Experience years
+    m = re.search(r"(\d+)\s*year", tl)
+    if m:
+        job["experience_years"] = job["experience_years"] or m.group(1) + " years"
+
+    # Views / applications
+    m_views = re.search(r"(\d+)\s*view", tl)
+    if m_views:
+        job["views"] = job["views"] or m_views.group(1)
+
+    m_apps = re.search(r"(\d+)\s*appli", tl)
+    if m_apps:
+        job["applications"] = job["applications"] or m_apps.group(1)
+
+    # Domain / industry
+    domains = [
+        "fintech", "healthcare", "medtech", "edtech", "e-commerce", "gaming",
+        "blockchain", "crypto", "ai", "ml", "saas", "cybersecurity", "telecom",
+        "logistics", "travel", "real estate", "media", "ad tech",
+    ]
+    for d in domains:
+        if d in tl:
+            job["domain"] = job["domain"] or d.title()
+            break
+
+    # Company type
+    for pat, val in [
+        (r"product\s+company", "Product"),
+        (r"outsource",         "Outsource"),
+        (r"outstaf",           "Outstaff"),
+        (r"startup",           "Startup"),
+        (r"agency",            "Agency"),
+    ]:
+        if re.search(pat, tl):
+            job["company_type"] = job["company_type"] or val
+            break
+
+    # Company size
+    m_size = re.search(r"(\d+[\d\s–\-]+\d+)\s*(people|employees|specialists|developers)?", tl)
+    if m_size:
+        job["company_size"] = job["company_size"] or m_size.group(1).strip()
+
+    # Skills tags  — look for <span class="... badge ..."> or similar in a dedicated block
+    if not job["skills"]:
+        skill_els = soup.select(
+            ".job-additional-info .technologies-list span, "
+            ".job-tags span, "
+            "a[href*='/jobs/?primary_keyword='], "
+            "a[href*='?keyword=']"
+        )
+        if skill_els:
+            job["skills"] = ", ".join(
+                dict.fromkeys(el.get_text(strip=True) for el in skill_els if el.get_text(strip=True))
+            )
+
+    # Full description text
+    if not job["description"]:
+        desc_el = soup.select_one(
+            ".job-description, "
+            "#job-description, "
+            "div.row section.col-xs-12, "
+            "div[data-original-text]"
+        )
+        if desc_el:
+            job["description"] = desc_el.get_text(" ", strip=True)[:2000]
+
+    # Title fallback
+    if not job["title"]:
+        h1 = soup.find("h1")
+        if h1:
+            job["title"] = _text(h1)
+
+    # Company fallback
+    if not job["company"]:
+        el = soup.select_one("a.company-name, a[href*='/jobs/company-']")
+        if el:
+            job["company"] = _text(el)
+
+    return job
+
+
+# ── Graceful shutdown ─────────────────────────────────────────────────────────
+
+_shutdown = False
+
+def _handle_signal(sig, frame):
+    global _shutdown
+    log.warning("Signal %s received — finishing current batch then saving...", sig)
+    _shutdown = True
+
+
+signal.signal(signal.SIGINT,  _handle_signal)
+signal.signal(signal.SIGTERM, _handle_signal)
+
+
+# ── Main orchestration ────────────────────────────────────────────────────────
+
+async def scrape_detail(
+    session: aiohttp.ClientSession,
+    sem: asyncio.Semaphore,
+    stub: dict,
+) -> dict | None:
+    url = stub.get("url", "")
+    if not url:
+        return stub
+    if not url.startswith("http"):
+        url = BASE_URL + url
+    html = await fetch(session, url, sem)
+    if html is None:
+        return stub  # return with listing-only data
+    return parse_detail_page(html, stub)
+
+
+async def collect_all_urls(
+    session: aiohttp.ClientSession,
+    sem: asyncio.Semaphore,
+    start_page: int,
+) -> tuple[list[dict], int]:
+    """Fetch all listing pages and return stubs + total pages discovered."""
+    log.info("Fetching page 1 to discover total pages…")
+    html = await fetch(session, f"{JOBS_URL}?page=1", sem)
+    if not html:
+        log.error("Failed to fetch page 1 — aborting")
+        return [], 0
+
+    first_stubs, total_pages = parse_listing_page(html)
+    log.info("Total pages: %d", total_pages)
+
+    all_stubs: list[dict] = first_stubs if start_page <= 1 else []
+
+    pages = list(range(max(2, start_page), total_pages + 1))
+
+    async def fetch_page(page: int) -> list[dict]:
+        if _shutdown:
+            return []
+        h = await fetch(session, f"{JOBS_URL}?page={page}", sem)
+        if not h:
+            log.warning("Empty response on listing page %d", page)
+            return []
+        stubs, _ = parse_listing_page(h)
+        return stubs
+
+    log.info("Fetching %d listing pages concurrently…", len(pages))
+    results = await tqdm.gather(
+        *[fetch_page(p) for p in pages],
+        desc="Listing pages",
+        unit="page",
+    )
+    for r in results:
+        all_stubs.extend(r)
+
+    return all_stubs, total_pages
+
+
+async def main() -> None:
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    # Load checkpoint
+    ckpt       = load_checkpoint()
+    done_urls  = set(ckpt["done_urls"])
+    last_page  = ckpt["last_page"]
+
+    if done_urls:
+        log.info("Resuming — %d jobs already scraped", len(done_urls))
+
+    init_csv()
+
+    connector = aiohttp.TCPConnector(limit=CONCURRENCY, ssl=False)
+    sem       = asyncio.Semaphore(CONCURRENCY)
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+
+        # ── Phase 1: collect all job stubs from listing pages ─────────────
+        all_stubs, total_pages = await collect_all_urls(session, sem, start_page=last_page + 1)
+
+        # Filter already-done jobs
+        pending = [s for s in all_stubs if s.get("url") and s["url"] not in done_urls]
+        log.info(
+            "Jobs discovered: %d total, %d pending (skipping %d already done)",
+            len(all_stubs), len(pending), len(done_urls),
+        )
+
+        # ── Phase 2: fetch detail pages ───────────────────────────────────
+        BATCH = 50  # save every N completions
+
+        async def do_detail(stub: dict) -> dict | None:
+            if _shutdown:
+                return None
+            return await scrape_detail(session, sem, stub)
+
+        pbar   = tqdm(total=len(pending), desc="Detail pages", unit="job")
+        buffer: list[dict] = []
+
+        tasks = [asyncio.create_task(do_detail(s)) for s in pending]
+
+        for coro in asyncio.as_completed(tasks):
+            result = await coro
+            pbar.update(1)
+            if result is None:
+                continue
+            buffer.append(result)
+            done_urls.add(result.get("url", ""))
+
+            if len(buffer) >= BATCH or _shutdown:
+                append_rows(buffer)
+                save_checkpoint(done_urls, total_pages)
+                log.info("Saved batch of %d | total done: %d", len(buffer), len(done_urls))
+                buffer.clear()
+
+            if _shutdown:
+                log.warning("Shutdown requested — flushing and exiting")
+                # Cancel remaining tasks
+                for t in tasks:
+                    t.cancel()
+                break
+
+        pbar.close()
+
+        # Final flush
+        if buffer:
+            append_rows(buffer)
+            save_checkpoint(done_urls, total_pages)
+            log.info("Final flush: %d rows", len(buffer))
+
+    total_rows = sum(1 for _ in open(OUTPUT_PATH, encoding="utf-8")) - 1  # minus header
+    log.info("Done. %d total rows in %s", total_rows, OUTPUT_PATH)
+
+    if not _shutdown:
+        # Clean checkpoint on clean exit
+        CHECKPOINT_PATH.unlink(missing_ok=True)
+        log.info("Checkpoint cleared (clean finish)")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
