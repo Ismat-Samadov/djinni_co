@@ -34,11 +34,11 @@ from tqdm.asyncio import tqdm
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_URL        = "https://djinni.co"
 JOBS_URL        = f"{BASE_URL}/jobs/"
-CONCURRENCY     = 8          # parallel HTTP requests
+CONCURRENCY     = 3          # parallel HTTP requests (low to avoid IP block)
 MAX_RETRIES     = 5          # retries per URL
-BACKOFF_BASE    = 1.5        # seconds (doubles each retry + jitter)
-REQUEST_TIMEOUT = 20         # seconds per request
-MIN_DELAY       = 0.3        # seconds between requests per worker
+BACKOFF_BASE    = 2.0        # seconds (doubles each retry + jitter)
+REQUEST_TIMEOUT = 25         # seconds per request
+MIN_DELAY       = 1.0        # seconds between requests per worker
 OUTPUT_PATH     = Path(__file__).parent.parent / "data" / "djinni.csv"
 CHECKPOINT_PATH = Path(__file__).parent.parent / "data" / ".djinni_checkpoint.json"
 
@@ -146,7 +146,7 @@ async def fetch(
     async with sem:
         for attempt in range(1, retries + 1):
             try:
-                await asyncio.sleep(MIN_DELAY + random.uniform(0, 0.3))
+                await asyncio.sleep(MIN_DELAY + random.uniform(0, 0.5))
                 async with session.get(
                     url,
                     headers=HEADERS,
@@ -154,16 +154,28 @@ async def fetch(
                     allow_redirects=True,
                 ) as resp:
                     if resp.status == 429:
-                        wait = BACKOFF_BASE ** attempt + random.uniform(0, 1)
+                        wait = BACKOFF_BASE ** attempt + random.uniform(2, 5)
                         log.warning("429 rate-limit on %s — waiting %.1fs", url, wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    if resp.status == 403:
+                        wait = BACKOFF_BASE ** attempt + random.uniform(2, 5)
+                        log.warning("403 on %s — waiting %.1fs", url, wait)
                         await asyncio.sleep(wait)
                         continue
                     if resp.status == 404:
                         return None
                     resp.raise_for_status()
-                    return await resp.text(encoding="utf-8", errors="replace")
+                    text = await resp.text(encoding="utf-8", errors="replace")
+                    # Detect IP block page (short response with "blocked" message)
+                    if len(text) < 500 and "blocked" in text.lower():
+                        wait = 30 + random.uniform(5, 15)
+                        log.warning("IP BLOCKED on %s — waiting %.0fs before retry", url, wait)
+                        await asyncio.sleep(wait)
+                        continue
+                    return text
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                wait = BACKOFF_BASE ** attempt + random.uniform(0, 1)
+                wait = BACKOFF_BASE ** attempt + random.uniform(0, 2)
                 log.warning(
                     "Attempt %d/%d failed for %s (%s) — retrying in %.1fs",
                     attempt, retries, url, exc, wait,
@@ -265,11 +277,20 @@ def _text(el) -> str:
 
 
 def parse_detail_page(html: str, stub: dict) -> dict:
-    """Enrich a job stub with fields scraped from the detail page."""
+    """
+    Enrich a job stub with fields scraped from the detail page.
+    Djinni renders most meta as bare <span> tags with no CSS classes,
+    so we rely on full body-text regex + JSON-LD.
+    Returns None if the page is an IP-block response.
+    """
+    # Detect IP block / empty page
+    if len(html) < 500 and ("blocked" in html.lower() or "contact us" in html.lower()):
+        return None
+
     soup = BeautifulSoup(html, "lxml")
     job  = dict(stub)  # copy
 
-    # ── JSON-LD on detail page (may duplicate some listing fields) ────────
+    # ── JSON-LD ───────────────────────────────────────────────────────────
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "")
@@ -278,93 +299,85 @@ def parse_detail_page(html: str, stub: dict) -> dict:
         if not isinstance(data, dict) or data.get("@type") != "JobPosting":
             continue
 
+        # City & country from jobLocation
         jp_loc = data.get("jobLocation", {}) or {}
         addr   = jp_loc.get("address", {}) or {}
         if isinstance(addr, dict):
-            job["city"]    = job["city"]    or addr.get("addressLocality", "")
+            loc = addr.get("addressLocality", "")
+            job["city"]    = job["city"]    or (loc[0] if isinstance(loc, list) else loc)
             job["country"] = job["country"] or addr.get("addressCountry", "")
 
+        # Domain / industry — JSON-LD has explicit 'industry' key on detail pages
+        job["domain"] = job["domain"] or data.get("industry", "")
+
+        # Location regions from applicantLocationRequirements
+        if not job["location_regions"]:
+            alr = data.get("applicantLocationRequirements", [])
+            if isinstance(alr, dict):
+                alr = [alr]
+            regions: list[str] = []
+            for a in (alr or []):
+                if isinstance(a, dict):
+                    name = a.get("name", "")
+                    inner_addr = a.get("address", {}) or {}
+                    country = inner_addr.get("addressCountry", "") if isinstance(inner_addr, dict) else ""
+                    regions.append(name or country)
+            job["location_regions"] = ", ".join(r for r in regions if r)
+
+        # Full description
         if not job["description"]:
             raw_desc = data.get("description", "")
             if raw_desc:
                 desc_soup = BeautifulSoup(raw_desc, "lxml")
                 job["description"] = desc_soup.get_text(" ", strip=True)[:2000]
 
-        # skills from 'skills' field
-        skills_raw = data.get("skills", "")
-        if skills_raw and not job["skills"]:
-            job["skills"] = skills_raw if isinstance(skills_raw, str) else ", ".join(skills_raw)
+    # ── Full body text — all detail fields are bare <span> with no classes ─
+    body_text = soup.get_text(" ", strip=True)
 
-    # ── HTML badge/label parsing ──────────────────────────────────────────
-    # Djinni puts all job meta as small badges inside .job-details--title-wrapper
-    # or inside ul.job-additional-info > li
+    # Views
+    m = re.search(r"(\d+)\s*views?", body_text, re.I)
+    if m:
+        job["views"] = job["views"] or m.group(1)
 
-    badge_texts: list[str] = []
-    for el in soup.select(
-        ".job-additional-info li, "
-        ".job-details--title-wrapper span, "
-        ".job-details--title-wrapper div, "
-        "p.text-default-7, "
-        ".label-group span, "
-        ".badge"
-    ):
-        t = el.get_text(" ", strip=True)
-        if t:
-            badge_texts.append(t)
+    # Applications
+    m = re.search(r"(\d+)\s*application", body_text, re.I)
+    if m:
+        job["applications"] = job["applications"] or m.group(1)
 
-    tl = " | ".join(badge_texts).lower()
-
-    # English level
+    # English level — ordered most-specific first
     for pat, val in [
-        (r"upper[\s-]inter\w*",  "Upper Intermediate"),
-        (r"lower[\s-]inter\w*",  "Lower Intermediate"),
-        (r"inter\w*",            "Intermediate"),
-        (r"advanced",            "Advanced"),
-        (r"fluent",              "Fluent"),
-        (r"b2",                  "B2"),
-        (r"b1",                  "B1"),
-        (r"c1",                  "C1"),
-        (r"c2",                  "C2"),
-        (r"no english",          "No English"),
+        (r"upper[\s\-]?intermediate",  "Upper Intermediate"),
+        (r"lower[\s\-]?intermediate",  "Lower Intermediate"),
+        (r"no\s+english",              "No English"),
+        (r"c2",                        "C2 Proficient"),
+        (r"c1",                        "C1 Advanced"),
+        (r"b2",                        "B2 Upper Intermediate"),
+        (r"b1",                        "B1 Intermediate"),
+        (r"advanced",                  "Advanced"),
+        (r"fluent",                    "Fluent"),
+        (r"intermediate",              "Intermediate"),
     ]:
-        if re.search(pat, tl):
+        if re.search(pat, body_text, re.I):
             job["english_level"] = job["english_level"] or val
             break
 
     # Work format
     for pat, val in [
-        (r"\bhybrid\b",  "Hybrid"),
-        (r"\boffice\b",  "Office"),
-        (r"\bremote\b",  "Remote"),
+        (r"hybrid",       "Hybrid"),
+        (r"office\s+work","Office"),
+        (r"\boffice\b",   "Office"),
+        (r"remote\s+work","Remote"),
+        (r"\bremote\b",   "Remote"),
     ]:
-        if re.search(pat, tl):
+        if re.search(pat, body_text, re.I):
             job["work_format"] = job["work_format"] or val
             break
 
-    # Experience years
-    m = re.search(r"(\d+)\s*year", tl)
+    # Experience years (e.g. "5 years", "3+ years")
+    m = re.search(r"(\d+)\+?\s*years?\s+of\s+exp|(\d+)\+?\s*years?\s+exp|(\d+)\s+years?\b", body_text, re.I)
     if m:
-        job["experience_years"] = job["experience_years"] or m.group(1) + " years"
-
-    # Views / applications
-    m_views = re.search(r"(\d+)\s*view", tl)
-    if m_views:
-        job["views"] = job["views"] or m_views.group(1)
-
-    m_apps = re.search(r"(\d+)\s*appli", tl)
-    if m_apps:
-        job["applications"] = job["applications"] or m_apps.group(1)
-
-    # Domain / industry
-    domains = [
-        "fintech", "healthcare", "medtech", "edtech", "e-commerce", "gaming",
-        "blockchain", "crypto", "ai", "ml", "saas", "cybersecurity", "telecom",
-        "logistics", "travel", "real estate", "media", "ad tech",
-    ]
-    for d in domains:
-        if d in tl:
-            job["domain"] = job["domain"] or d.title()
-            break
+        yrs = next(g for g in m.groups() if g)
+        job["experience_years"] = job["experience_years"] or yrs + " years"
 
     # Company type
     for pat, val in [
@@ -374,38 +387,40 @@ def parse_detail_page(html: str, stub: dict) -> dict:
         (r"startup",           "Startup"),
         (r"agency",            "Agency"),
     ]:
-        if re.search(pat, tl):
+        if re.search(pat, body_text, re.I):
             job["company_type"] = job["company_type"] or val
             break
 
-    # Company size
-    m_size = re.search(r"(\d+[\d\s–\-]+\d+)\s*(people|employees|specialists|developers)?", tl)
-    if m_size:
-        job["company_size"] = job["company_size"] or m_size.group(1).strip()
+    # Company size (e.g. "51-200 employees", "200+ people")
+    m = re.search(r"(\d+[\+\-–]\d*)\s*(people|employees|specialists|engineers)?", body_text, re.I)
+    if m:
+        job["company_size"] = job["company_size"] or m.group(1).strip()
 
-    # Skills tags  — look for <span class="... badge ..."> or similar in a dedicated block
+    # Skills — Djinni links keywords in job descriptions / tag lists
     if not job["skills"]:
         skill_els = soup.select(
-            ".job-additional-info .technologies-list span, "
-            ".job-tags span, "
-            "a[href*='/jobs/?primary_keyword='], "
-            "a[href*='?keyword=']"
+            "a[href*='primary_keyword='], "
+            "a[href*='?keyword='], "
+            "a[href*='/jobs/?page=1&keywords=']"
         )
         if skill_els:
             job["skills"] = ", ".join(
                 dict.fromkeys(el.get_text(strip=True) for el in skill_els if el.get_text(strip=True))
             )
 
-    # Full description text
+    # Description fallback — look for the main content div
     if not job["description"]:
-        desc_el = soup.select_one(
-            ".job-description, "
-            "#job-description, "
-            "div.row section.col-xs-12, "
-            "div[data-original-text]"
-        )
-        if desc_el:
-            job["description"] = desc_el.get_text(" ", strip=True)[:2000]
+        for sel in [
+            "div[data-original-text]",
+            ".job-description__text",
+            ".job-description",
+            "#job-description",
+            "section.col-xs-12",
+        ]:
+            el = soup.select_one(sel)
+            if el:
+                job["description"] = el.get_text(" ", strip=True)[:2000]
+                break
 
     # Title fallback
     if not job["title"]:
@@ -415,7 +430,7 @@ def parse_detail_page(html: str, stub: dict) -> dict:
 
     # Company fallback
     if not job["company"]:
-        el = soup.select_one("a.company-name, a[href*='/jobs/company-']")
+        el = soup.select_one("a[href*='/jobs/company-']")
         if el:
             job["company"] = _text(el)
 
