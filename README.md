@@ -1,8 +1,8 @@
 # Ukrainian Tech Job Market — Business Intelligence Report
 
-**Source:** Djinni.co — Ukraine's largest tech job board
-**Snapshot date:** February 15, 2026
-**Dataset:** 9,596 active job listings across all categories
+- **Source:** Djinni.co — Ukraine's largest tech job board
+- **Snapshot date:** February 15, 2026
+- **Dataset:** 9,596 active job listings across all categories
 
 ---
 
